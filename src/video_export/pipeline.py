@@ -11,6 +11,10 @@ def render_master(config, state, timeout=3600, headless=False, window=2, decode=
     result = resolve.call("render", config, timeout=timeout, headless=headless,
                           checkpoint=state.folder / "resolve-job.json")
     checks = {"duration": result["timeline"]["duration"]}
+    if config.get("resolution"):
+        checks["width"], checks["height"] = map(int, config["resolution"].lower().split("x"))
+    if config.get("frame_rate"):
+        checks["frame_rate"] = config["frame_rate"]
     if expected and expected.get("duration") is not None:
         if abs(expected["duration"] - checks["duration"]) > 0.1:
             from .common import ExportError

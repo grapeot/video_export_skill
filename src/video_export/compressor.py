@@ -1,11 +1,13 @@
 """Apple Compressor CLI adapter, independent of Resolve."""
 
 import os
+import re
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from .common import ExportError, noisy_json, outputs_available, path, run
+from .rates import delivery_rate, rate
 from .verification import verify
 
 DEFAULT_BINARY = "/Applications/Compressor.app/Contents/MacOS/Compressor"
@@ -29,15 +31,24 @@ def preset(filename):
     extension = root.findtext(".//file-extension")
     if not extension or not extension.isalnum():
         raise ExportError("preset_invalid", "Preset has no valid file-extension")
+    automatic = video.find("automatic") if video is not None else None
+    automatic_geometry = ({key: automatic.get(key) for key in ("width", "height")}
+                          if automatic is not None else {})
+    resolution_mode = "follow_source" if "-100" in (width, height) else "explicit_or_other"
+    if any(value not in (None, "", "0", "-100") for value in automatic_geometry.values()):
+        resolution_mode = "automatic_geometry"
+    frame_rate = video.findtext("frame-rate") if video is not None else None
+    if frame_rate and frame_rate not in ("0", "R0/1", "-100"):
+        rate(frame_rate)
     return {"setting": str(file), "name": root.get("name"), "extension": extension,
             "codec": video.findtext("codec-type") if video is not None else None,
-            "frame_rate": video.findtext("frame-rate") if video is not None else None,
+            "frame_rate": frame_rate,
             "width": width, "height": height,
-            "resolution_mode": "follow_source" if "-100" in (width, height) else "explicit_or_other",
+            "resolution_mode": resolution_mode, "automatic_geometry": automatic_geometry,
             "video_enabled": video is not None and video.get("isEnabled") != "no"}
 
 
-def plan_targets(source, profile, settings=None, output=None, directory=None):
+def plan_targets(source, profile, settings=None, output=None, directory=None, max_frame_rate=None):
     source = path(source)
     targets = profile.get("compressor", {}).get("targets", [])
     if settings:
@@ -48,6 +59,10 @@ def plan_targets(source, profile, settings=None, output=None, directory=None):
     if output and len(targets) != 1:
         raise ExportError("config_invalid", "--output requires exactly one Compressor target")
     base = path(directory or profile.get("outputs", {}).get("directory") or source.parent)
+    maximum = (max_frame_rate if max_frame_rate is not None else
+               profile.get("compressor", {}).get("max_frame_rate"))
+    if maximum is not None:
+        rate(maximum)
     planned = []
     for target in targets:
         metadata = preset(target["setting"])
@@ -57,6 +72,8 @@ def plan_targets(source, profile, settings=None, output=None, directory=None):
             raise ExportError("output_invalid", "Output extension must match Compressor preset")
         planned.append({"setting": metadata["setting"], "output": str(path(filename)),
                         "preset": metadata})
+        if maximum is not None:
+            planned[-1]["max_frame_rate"] = str(maximum)
     outputs_available([target["output"] for target in planned], [source])
     return planned
 
@@ -110,20 +127,48 @@ def preset_expectations(metadata, source_info):
         # Follow-source dimensions can include cropping or padding; do not infer
         # geometry from -100 alone. Explicit --expect-resolution remains available.
     frame_rate = metadata.get("frame_rate")
-    if frame_rate and float(frame_rate) > 0:
-        checks["frame_rate"] = float(frame_rate)
+    if frame_rate and frame_rate not in ("0", "R0/1", "-100"):
+        checks["frame_rate"] = float(rate(frame_rate))
     return checks
+
+
+def delivery_targets(targets, source_info, state):
+    """Derive private settings, changing only the explicit frame-rate XML value."""
+    prepared = []
+    for index, original in enumerate(targets):
+        target = dict(original)
+        if target.get("max_frame_rate") is not None:
+            source_rate = source_info["video"].get("avg_frame_rate")
+            selected = delivery_rate(source_rate, target["max_frame_rate"])
+            text = path(target["setting"]).read_bytes()
+            replacement = f"R{selected.numerator}/{selected.denominator}".encode()
+            text, count = re.subn(rb"(<frame-rate>)[^<]*(</frame-rate>)",
+                                  lambda m: m[1] + replacement + m[2], text)
+            if count != 1:
+                raise ExportError("preset_invalid", "Delivery policy needs one frame-rate element")
+            derived = state.folder / f"delivery-{index + 1}.compressorsetting"
+            with derived.open("xb") as stream:
+                stream.write(text)
+            os.chmod(derived, 0o600)
+            target.update(original_setting=target["setting"], setting=str(derived),
+                          preset=preset(derived), delivery_frame_rate=float(selected))
+        prepared.append(target)
+    state.save(prepared_targets=prepared)
+    return prepared
 
 
 def transcode(source, targets, state, timeout=3600, poll=5, window=2, decode=False, expected=None):
     expected = expected or {}
     source_info = verify(source, {"duration": expected.get("duration")}, window=window)
+    targets = delivery_targets(targets, source_info, state)
     target_checks = []
     for target in targets:
         checks = {"duration": source_info["duration"],
                   **preset_expectations(target.get("preset", {}), source_info)}
         for key, value in expected.items():
-            if key in checks and key != "duration" and value != checks[key]:
+            equivalent = (abs(value - checks[key]) < 0.01 if key == "frame_rate" and key in checks
+                          else value == checks.get(key))
+            if key in checks and key != "duration" and not equivalent:
                 raise ExportError("expectation_conflict", "CLI expectation conflicts with preset",
                                   field=key, preset=checks[key], requested=value)
             if key != "duration":

@@ -77,9 +77,17 @@ def operate(resolve, request, owned=False):
     if output.suffix.lower() != "." + selected["format"].lower():
         raise ExportError("output_invalid", "Output extension must match selected render format",
                           selected=selected)
-    if not project.SetRenderSettings({"SelectAllFrames": True, "TargetDir": str(output.parent),
-                                      "CustomName": output.stem, "ExportVideo": True,
-                                      "ExportAudio": True}):
+    settings = {"SelectAllFrames": True, "TargetDir": str(output.parent),
+                "CustomName": output.stem, "ExportVideo": True, "ExportAudio": True}
+    if options.get("resolution"):
+        settings["FormatWidth"], settings["FormatHeight"] = map(
+            int, options["resolution"].lower().split("x"))
+    for key, setting in (("frame_rate", "FrameRate"), ("audio_codec", "AudioCodec"),
+                         ("audio_bit_depth", "AudioBitDepth"),
+                         ("audio_sample_rate", "AudioSampleRate")):
+        if key in options:
+            settings[setting] = options[key]
+    if not project.SetRenderSettings(settings):
         raise ExportError("resolve_setting_failed", "Could not set render output")
     require_budget(request)
     job_id = project.AddRenderJob()
@@ -108,7 +116,7 @@ def operate(resolve, request, owned=False):
                 raise ExportError("output_name_mismatch", "Resolve chose a different output name",
                                   job_id=job_id, actual=actual)
             return {"job_id": job_id, "status": status, "timeline": info,
-                    "format_codec": selected, "output": str(output)}
+                    "format_codec": selected, "render_settings": settings, "output": str(output)}
         if name in ("Failed", "Cancelled", "Canceled"):
             raise ExportError("render_job_failed", "Render did not succeed", job_id=job_id, status=status)
         time.sleep(1)

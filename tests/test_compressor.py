@@ -1,10 +1,13 @@
 import json
+from fractions import Fraction
+from pathlib import Path
 
 import pytest
 
 from video_export import compressor
 from video_export.common import ExportError, noisy_json
 from video_export.state import RunState
+from video_export.rates import delivery_rate, rate
 
 
 def test_preset_reports_actual_bounds(setting):
@@ -128,3 +131,57 @@ def test_monitor_deadline_and_remaining_budget(tmp_path, monkeypatch):
     with pytest.raises(ExportError) as error:
         compressor.transcode(tmp_path / "source.mov", [], RunState(tmp_path / "runs"), timeout=1)
     assert error.value.code == "compressor_timeout" and budgets == [1]
+
+
+@pytest.mark.parametrize("source,expected", [("23.976", Fraction(24000, 1001)),
+    ("24", Fraction(24)), ("29.97", Fraction(30000, 1001)), ("30", Fraction(30)),
+    ("59.94", Fraction(60000, 1001)), ("60", Fraction(60)),
+    ("119.88", Fraction(60000, 1001)), ("120", Fraction(60))])
+def test_delivery_cap_preserves_cadence(source, expected):
+    assert delivery_rate(source, 60) == expected
+
+
+@pytest.mark.parametrize("invalid", ["R-1/0", "0/0", "nan", "inf", "-24", "0"])
+def test_invalid_rate_is_structured(invalid):
+    with pytest.raises(ExportError) as error:
+        rate(invalid)
+    assert error.value.code == "frame_rate_invalid"
+
+
+def test_rational_preset_rate_and_automatic_geometry(setting):
+    setting.write_text(setting.read_text().replace("<frame-rate>-100</frame-rate>",
+        '<frame-rate>R60/1</frame-rate><automatic width="-1920" height="1080"/>'))
+    metadata = compressor.preset(setting)
+    assert metadata["resolution_mode"] == "automatic_geometry"
+    assert metadata["automatic_geometry"] == {"width": "-1920", "height": "1080"}
+    assert compressor.preset_expectations(metadata, {})["frame_rate"] == 60
+
+
+def test_delivery_setting_changes_only_rate_and_never_original(setting, tmp_path):
+    original = setting.read_bytes().replace(b"<frame-rate>-100</frame-rate>",
+        b"<frame-rate>R60/1</frame-rate><data-rate>123456</data-rate>"
+        b"<auto-purpose>yes</auto-purpose><embedded_dovis_format>1</embedded_dovis_format>")
+    setting.write_bytes(original)
+    targets = compressor.plan_targets(tmp_path / "source.mov", {"compressor": {
+        "max_frame_rate": 60, "targets": [{"setting": str(setting), "suffix": "-delivery"}]}})
+    state = RunState(tmp_path / "runs")
+    prepared = compressor.delivery_targets(targets, {"video": {"avg_frame_rate": "30000/1001"}}, state)
+    derived = prepared[0]
+    assert Path(derived["setting"]).stat().st_mode & 0o777 == 0o600
+    assert setting.read_bytes() == original
+    assert Path(derived["setting"]).read_bytes() == original.replace(
+        b"<frame-rate>R60/1</frame-rate>", b"<frame-rate>R30000/1001</frame-rate>")
+    assert derived["delivery_frame_rate"] == float(Fraction(30000, 1001))
+    assert compressor.preset_expectations(derived["preset"], {})["frame_rate"] == derived["delivery_frame_rate"]
+    assert targets[0]["setting"] == str(setting)
+    assert state.data["prepared_targets"] == prepared
+
+
+def test_rounded_ntsc_expectation_matches_rational_preset(tmp_path, monkeypatch):
+    monkeypatch.setattr(compressor, "verify", lambda *a, **k: {"duration": 2})
+    monkeypatch.setattr(compressor, "run", lambda *a, **kw: '{"batch":{"batchID":"b"}}')
+    monkeypatch.setattr(compressor, "status", lambda *a, **kw: {"batchid": "b", "status": "Successful"})
+    targets = [{"output": str(tmp_path / "out.mov"), "setting": "/path/preset",
+                "preset": {"frame_rate": "R30000/1001"}}]
+    assert compressor.transcode(tmp_path / "source.mov", targets, RunState(tmp_path / "runs"),
+                                expected={"frame_rate": 29.97})["batch_id"] == "b"

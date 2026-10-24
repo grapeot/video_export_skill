@@ -61,6 +61,18 @@ def test_failed_render_is_not_success(tmp_path):
     assert error.value.code == "render_job_failed"
 
 
+def test_render_overrides_are_applied_after_preset(tmp_path):
+    output = tmp_path / "master.mov"
+    resolve, calls = fake_project(output)
+    operate(resolve, {"action": "render", "options": {
+        "project": "Demo", "timeline": "Main", "preset": "ProRes", "output": str(output),
+        "resolution": "7680x4320", "frame_rate": 29.97,
+        "audio_codec": "lpcm", "audio_bit_depth": 24, "audio_sample_rate": 48000}})
+    assert calls[0]["FormatWidth"] == 7680 and calls[0]["FormatHeight"] == 4320
+    assert calls[0]["FrameRate"] == 29.97 and calls[0]["AudioCodec"] == "lpcm"
+    assert calls[0]["AudioBitDepth"] == 24 and calls[0]["AudioSampleRate"] == 48000
+
+
 def test_late_headless_readiness_never_submits_job(tmp_path, monkeypatch):
     import sys
     from video_export import resolve_worker as worker

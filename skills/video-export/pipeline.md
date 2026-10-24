@@ -4,13 +4,13 @@ Use this focused skill when running an end-to-end workflow that renders a master
 
 ## Done Means
 
-1. **Dry-run plan verified first:** `video-export pipeline run` (without `--execute`) returned `ok: true` and `dry_run: true`, showing the resolved Resolve configuration, all Compressor targets, and zero output path collisions (note: dry-run does not connect to Resolve or write a manifest).
+1. **Dry-run plan verified first:** `video-export pipeline run` (without `--execute`) returned `ok: true` and `dry_run: true`, showing the resolved Resolve configuration, all Compressor targets (including `max_frame_rate` if configured), and zero output path collisions (note: dry-run does not connect to Resolve, probe media sources, create derived presets, or write a manifest).
 2. **Master stage succeeded:**
-   - Either Resolve rendered the master timeline under `--execute`, reached `JobStatus == "Complete"`, and passed `lsof`, `--stability-window`, and `ffprobe` verification (including duration matching the Resolve timeline duration within `0.1`s), **or**
+   - Either Resolve rendered the master timeline under `--execute`, reached `JobStatus == "Complete"`, and passed `lsof`, `--stability-window`, and `ffprobe` verification (including duration matching the Resolve timeline duration within `0.1`s and automatic verification of any configured Resolve `resolution` or `frame_rate` overrides), **or**
    - `--reuse-master /path/to/prior/manifest.json` was passed, matching the full Resolve configuration identity and the master file's on-disk metadata fingerprint (`path`, `size`, `mtime_ns`), and the master file passed a fresh `verify()` check on disk.
 3. **Compressor stage succeeded:**
-   - Compressor re-verified the master as a stable input source, submitted the batch, reached terminal status `Successful` for the batch ID, and verified every target output file via `lsof`, `--stability-window`, and `ffprobe` (duration matching the master within `0.1`s, plus any `--expect-*` delivery checks and optional `--verify-decode`).
-4. **Master retained and manifest saved:** Both the master file and all target files remain on disk, and the new run's `manifest.json` path is returned in stdout.
+   - Compressor re-verified the master as a stable input source, derived private byte-preserving `.compressorsetting` files in the run state directory when `--max-frame-rate` / `[compressor] max_frame_rate` was set (`prepared_targets`), submitted the batch, reached terminal status `Successful` for the batch ID, and verified every target output file via `lsof`, `--stability-window`, and `ffprobe` (duration matching the master within `0.1`s, target preset/derived frame-rate checks, plus any `--expect-*` delivery checks including `--expect-frame-rate` and optional `--verify-decode`).
+4. **Master retained and manifest saved:** Both the master file and all target files remain on disk, original `.compressorsetting` presets remain untouched, and the new run's `manifest.json` path is returned in stdout.
 
 ## Pipeline Rules & Caveats
 
@@ -18,11 +18,14 @@ Use this focused skill when running an end-to-end workflow that renders a master
 - **Strict failure gate:** If the Resolve render fails, times out, or fails `lsof` / stability / `ffprobe` verification, Compressor is never invoked.
 - **`--reuse-master MANIFEST` provenance is metadata-based:**
   - `--reuse-master` requires an **explicit path** to a prior `manifest.json` (not a boolean flag).
-  - It checks that the prior manifest has `master.verified == true`, the exact same Resolve config `identity` (`project`, `timeline`, `preset`, `output`, and optional `format`/`codec`), and the same file metadata `fingerprint` (`path`, `size`, `mtime_ns`).
+  - It checks that the prior manifest has `master.verified == true`, the exact same Resolve config `identity` (`project`, `timeline`, `preset`, `output`, and any optional `format`/`codec`, `resolution`, `frame_rate`, or audio overrides), and the same file metadata `fingerprint` (`path`, `size`, `mtime_ns`).
   - This metadata check avoids hashing multi-gigabyte masters on retry, but it is **not** a SHA-256 content hash and **cannot** detect whether you edited the timeline inside DaVinci Resolve. Always run a fresh render (without `--reuse-master`) after editing your Resolve project.
+- **Resolve post-preset overrides and Compressor `--max-frame-rate`:**
+  - Optional Resolve flags (`--resolution`, `--frame-rate`, `--audio-codec`, `--audio-bit-depth`, `--audio-sample-rate` or matching `[resolve]` TOML string keys) are applied after loading the Deliver preset without modifying the timeline rate, and `render_master` automatically verifies configured master `resolution` and `frame_rate`.
+  - Optional `--max-frame-rate RATE` (or `[compressor] max_frame_rate = 60`) applies the cap-preserving cadence policy during `--execute`: it verifies the master first, keeps exact source rates at or below the cap (`23.976, 24, 29.97, 30, 59.94, 60` for cap `60`), repeatedly halves above-cap rates (`119.88 -> 59.94`, `120 -> 60`) with exact NTSC rationals, and writes private derived `.compressorsetting` files in the run state directory modifying only the single `<frame-rate>` element byte-for-byte (`prepared_targets` in `manifest.json`).
 - **Meaning of `--output` and `--expect-*` in `pipeline run`:**
   - In `pipeline run`, `--output` overrides `[resolve].output` (the **master** file path). Target paths come from `[[compressor.targets]]` (`output` or `suffix` + `--directory` / `[outputs].directory`), or from repeating `--setting` on the CLI.
-  - In `pipeline run`, `--expect-*` flags validate the **Compressor delivery targets** (the master is automatically checked against the Resolve timeline duration). To check `--expect-*` on a master directly, run `video-export resolve render`.
+  - In `pipeline run`, `--expect-*` flags (including `--expect-frame-rate` and `--expect-resolution`) validate the **Compressor delivery targets** (the master is automatically checked against the Resolve timeline duration and any configured `[resolve]` resolution/frame-rate overrides). Note that a single shared `--expect-resolution` flag cannot assert distinct dimensions across mixed-resolution targets. To check `--expect-*` on a master directly, run `video-export resolve render`.
 
 ## External TOML Profile Example
 
@@ -32,10 +35,20 @@ project = "Demo Project"
 timeline = "Main Edit"
 preset = "ProRes_Master"
 output = "/path/to/exports/episode_master.mov"
+# Optional post-preset render setting overrides (profile values are strings):
+# resolution = "3840x2160"
+# frame_rate = "59.94"
+# audio_codec = "lpcm"
+# audio_bit_depth = "24"
+# audio_sample_rate = "48000"
 
 [outputs]
 directory = "/path/to/exports"
 keep_master = true
+
+[compressor]
+# Optional cap-preserving cadence ceiling:
+# max_frame_rate = 60
 
 [[compressor.targets]]
 setting = "/path/to/presets/web_1080p.compressorsetting"
@@ -60,13 +73,17 @@ video-export pipeline run \
   [--verify-decode] \
   --execute
 
-# 3. Override Resolve settings and delivery expectations on the CLI
+# 3. Override Resolve settings, Compressor frame-rate cap, and delivery expectations on the CLI
 video-export pipeline run \
   --profile /path/to/profile.toml \
   --project "Demo Project" \
   --timeline "Cut B" \
   --preset "Broadcast_ProRes" \
   --output /path/to/exports/cut_b_master.mov \
+  --resolution 3840x2160 \
+  --frame-rate 59.94 \
+  --max-frame-rate 60 \
+  --expect-frame-rate 59.94 \
   --expect-codec hevc \
   --expect-resolution 1920x1080 \
   --verify-decode \
@@ -83,7 +100,7 @@ video-export pipeline run \
 
 | `error` | Stage | Meaning & Next Step |
 |---|---|---|
-| `config_invalid` | Preflight | Invalid/missing TOML key, `keep_master = false`, or `format`/`codec` not supplied together. |
+| `config_invalid` / `frame_rate_invalid` | Preflight | Invalid/missing TOML key, `keep_master = false`, `format`/`codec` not supplied together, or invalid override/frame-rate value. |
 | `output_collision` | Preflight | Master or target output path already exists on disk (or duplicates another path). Choose unused output paths, or pass `--reuse-master /path/to/manifest.json` if reusing an existing master with new target paths. |
 | `unverified_master_provenance` | Master reuse | Prior `manifest.json` is missing/invalid, Resolve config options changed, or the master file's `path`/`size`/`mtime_ns` changed. Render a fresh master. |
 | `foreign_project_loaded` | Resolve | Attached GUI Resolve has another named project open. Switch projects in Resolve first. |
