@@ -1,91 +1,73 @@
 # Apple Compressor Transcode (`video-export compressor`)
 
-> **Scaffold Status (2026-10-24):** This document specifies the planned `video-export compressor` subcommands and empirically verified Apple Compressor CLI behaviors.
-
-Use this focused skill when inspecting `.compressorsetting` preset files, submitting standalone transcoding batches to Apple Compressor, or monitoring batch progress via `video-export compressor`.
+Use this focused skill when inspecting `.compressorsetting` XML presets, submitting standalone transcoding batches to Apple Compressor, or checking batch status via `video-export compressor`.
 
 ## Done Means
 
-- Source media was verified before submission: no process held the source file open for writing (`lsof`), byte size remained constant across the bounded stability window, and `ffprobe` confirmed valid streams.
-- A dry-run plan was checked first (without `--execute`), confirming complete output file paths for all targets and zero file collisions.
-- Under `--execute`, Compressor returned a `batchID`, `-monitor -format json -batchid <ID> -once` reached terminal status `Successful` (distinguished from queued `Waiting`/`Processing` and terminal `Failed`/`Cancelled`), and **every** planned target output file was verified on disk via `lsof`, byte-size stability, and `ffprobe` (duration, codec, resolution, and color tags when specified, plus optional `ffmpeg` full decode via `--verify-decode`).
-- The per-run `manifest.json` recorded the `batchID`, `jobID`s, target paths, and verification outcomes.
+- `video-export compressor doctor` confirms the Compressor binary (`/Applications/Compressor.app/Contents/MacOS/Compressor` or `VIDEO_EXPORT_COMPRESSOR`) and required helpers (`ffprobe`, `lsof`, and `ffmpeg` when `--verify-decode` is used).
+- A dry-run plan (without `--execute`) validated the `.compressorsetting` XML files, resolved target output paths, and confirmed zero output path collisions.
+- Under `--execute`, the input file passed `lsof`, `--stability-window`, and `ffprobe` checks prior to submission; Compressor returned a `batchID`; `-monitor -format json -batchid <ID> -once` reached `Successful` for that `batchID`; and **every** target output file passed `lsof`, `--stability-window`, and `ffprobe` checks (including duration matching the input within `0.1`s, any `--expect-*` checks, and optional `--verify-decode`).
+- The per-run `manifest.json` path returned in stdout recorded the batch ID, monitor payload, and verified target media properties.
 
-## Empirically Verified Compressor Facts & Pitfalls
+## Verified Compressor Behavior & Constraints
 
-1. **CLI executable and submission flags:**
-   - Binary: `/Applications/Compressor.app/Contents/MacOS/Compressor`
-   - Submission shape:
-     ```bash
-     /Applications/Compressor.app/Contents/MacOS/Compressor \
-       -batchname "video-export batch" \
-       -priority medium \
-       -jobpath "file:///path/to/input.mov" \
-       -settingpath "/path/to/presets/web_1080p.compressorsetting" \
-       -locationpath "/path/to/exports/input-1080p.mov" \
-       -outputformat json
-     ```
-   - **`-locationpath` must be a full filename:** Passing a directory path fails with `Parameter error: Destination is a directory; Expected complete output file path with file name.` Always pass the complete output file path including filename and extension.
-2. **Strict `-monitor` flag order:**
-   - `-format json` **must** immediately follow `-monitor`:
-     ```bash
-     /Applications/Compressor.app/Contents/MacOS/Compressor \
-       -monitor \
-       -format json \
-       -batchid "BATCH_ID" \
-       -once
-     ```
-   - Placing `-format json` at the end (after `-once`) fails with `Invalid parameter: -format`.
-3. **Diagnostic text around JSON output:**
-   - Compressor frequently prints diagnostic lines (for example `fileURL is NOT a directory`) alongside JSON output on stdout/stderr even when submission succeeds. Never treat that line alone as a failure; extract the JSON object tolerantly and validate `batchID` and target completion.
-4. **Queue semantics (`batchID` and `Waiting` vs terminal states):**
-   - Receiving a `batchID` and `jobID` on submission means only that the batch was **queued**, not that transcoding has started or finished.
-   - Monitor statuses include `Waiting`, `Processing`, `Successful`, `Failed`, and `Cancelled`. `Waiting` (or `Processing` at `0%` while waiting for an idle transcode service) is **not** a failure. Wait until the batch reaches `Successful` (or fails with `Failed`/`Cancelled`).
-5. **Multiple targets can share a single `jobID`:**
-   - When multiple `-jobpath` / `-settingpath` / `-locationpath` triples for the same source file are submitted in one batch, Compressor can merge them under a single `jobID`. Never assume one `jobID` per target; always verify each expected target output file on disk.
-6. **`.compressorsetting` presets are custom XML, not plists:**
-   - Preset files use a custom `<setting>` XML schema (`plutil` will fail on them).
-   - **Preset names do not guarantee output resolution:** Inside `<video-encode>`, a `bounds` width/height value of `-100` (or automatic sizing) means **follow source dimensions**. Always inspect the XML via `video-export compressor presets` rather than guessing resolution from the filename.
+1. **Submission & monitor flag order:**
+   - Submits batches via `/Applications/Compressor.app/Contents/MacOS/Compressor -batchname video-export -priority medium -jobpath file:///path/to/input.mov -settingpath /path/to/preset.compressorsetting -locationpath /path/to/output.mov -outputformat json`.
+   - `-locationpath` must be a complete file path whose extension matches the preset's `<file-extension>`.
+   - Queries status via `Compressor -monitor -format json -batchid <ID> -once` (`-format json` must immediately follow `-monitor`).
+   - Extracts JSON tolerantly (`noisy_json`) when Compressor prints diagnostic lines around the JSON payload.
+2. **Scoped queue polling & shared `jobID`s:**
+   - Submission only queues the batch. `batch_status()` matches the specific `batchID` and continues polling every `--poll` seconds while status is `Waiting` or `Processing`, never mistaking another batch's status or a child job status for batch completion.
+   - Multi-target batches can share a single `jobID`, so `video-export` verifies every target output file on disk after the batch reaches `Successful`.
+   - On `--timeout`, the active Compressor batch is not cancelled (`compressor_timeout`); its `batch_id` is retained in `manifest.json` and can be checked with `video-export compressor status --batch-id ID`.
+3. **`.compressorsetting` XML parsing:**
+   - Presets are custom `<setting>` XML files (not Apple plists).
+   - Inside `<video-encode>`, `<bounds>` width or height set to `"-100"` means `resolution_mode: "follow_source"` rather than fixed dimensions. Always inspect presets with `video-export compressor presets` instead of inferring dimensions from preset filenames.
+    - If `--setting` is omitted on `compressor presets`, `video-export` discovers `.compressorsetting` files under `~/Library/Group Containers/*.com.apple.videoProApps/Library/Application Support/Compressor/Settings/*.compressorsetting`.
+    - Execution checks each target's recognized codec, positive fixed bounds, and fixed frame rate. Follow-source bounds are not enough to infer final dimensions when transforms are involved; use `--expect-resolution` when dimensions are required. Source duration must also satisfy `--expect-duration` before submission; outputs always match measured source duration.
 
-## Mandatory Safety Rules
-
-- **Never submit a still-writing source file:** Submitting a file while Resolve or another process is still writing it produces truncated outputs. `compressor transcode --execute` enforces `lsof` open-writer checks, bounded file-size stability, and `ffprobe` validation before calling Compressor.
-- **Refuse output collisions and never delete sources:** If any target output path already exists, refuse the run. Never delete source media automatically.
-- **Never reset services or cancel other jobs:** Do not run `Compressor -resetBackgroundProcessing` or `-kill` on existing batches without explicit user instruction.
-
-## Planned Commands
+## Commands
 
 ```bash
-# Check Compressor binary and ffprobe/ffmpeg availability
-video-export compressor doctor
+# Check Compressor executable and ffprobe/ffmpeg/lsof paths
+video-export compressor doctor [--timeout 3600]
 
-# Parse .compressorsetting XML (codec, frame rate, fixed vs -100 follow-source bounds)
+# Inspect explicit or auto-discovered .compressorsetting XML files
 video-export compressor presets \
-  --setting /path/to/presets/web_1080p.compressorsetting \
-  --setting /path/to/presets/archive_hevc.compressorsetting
+  [--setting /path/to/presets/web_1080p.compressorsetting] \
+  [--setting /path/to/presets/archive_hevc.compressorsetting]
 
-# Dry-run transcode plan (single target via CLI flags, or multi-target via --profile)
+# Dry-run transcode plan (validates XML and output collisions; creates no manifest)
 video-export compressor transcode \
   --input /path/to/input.mov \
   --setting /path/to/presets/web_1080p.compressorsetting \
   --output /path/to/exports/input-1080p.mov
 
-# Execute transcode after source stability + ffprobe checks, then monitor and verify outputs
+# Execute single- or multi-target transcode and verify all outputs
 video-export compressor transcode \
   [--profile /path/to/profile.toml] \
   --input /path/to/input.mov \
-  [--expect-duration 120.5] \
+  [--setting /path/to/presets/web_1080p.compressorsetting] \
+  [--output /path/to/exports/input-1080p.mov] \
+  [--directory /path/to/exports] \
+  [--state-dir /path/to/state] \
+  [--stability-window 2] \
+  [--poll 5] \
+  [--expect-duration 120.0] \
   [--expect-codec hevc] \
   [--expect-resolution 1920x1080] \
   [--expect-color-primaries bt709] \
+  [--expect-color-transfer bt709] \
+  [--expect-color-space bt709] \
   [--verify-decode] \
+  [--timeout 3600] \
   --execute
 
-# Check status of an existing Compressor batch ID
-video-export compressor status --batch-id "BATCH_ID"
+# Query status of a submitted Compressor batch
+video-export compressor status --batch-id "BATCH_ID" [--timeout 3600]
 ```
 
-## TOML Profile Keys Used by `compressor transcode`
+## TOML Profile Keys & Target Resolution Rules
 
 ```toml
 [outputs]
@@ -98,7 +80,9 @@ suffix = "-1080p"
 
 [[compressor.targets]]
 setting = "/path/to/presets/archive_hevc.compressorsetting"
-suffix = "-hevc"
+output = "/path/to/exports/custom_archive.mov"
 ```
 
-Explicit CLI flags (`--setting`, `--output`, `--directory`) override TOML profile values.
+- Repeating `--setting` on the CLI overrides `[[compressor.targets]]` from `--profile` with generated suffixes `-1`, `-2`, etc.
+- `--output` on `compressor transcode` is valid only when there is a single target (`config_invalid` if multiple targets exist).
+- Target path precedence: CLI `--output` (single target) -> `target.output` -> `<base>/<input_stem><suffix>.<preset_extension>`, where `<base>` is `--directory` -> `[outputs].directory` -> `input.parent`.

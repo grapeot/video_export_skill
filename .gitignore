@@ -14,3 +14,7 @@ outputs/
 logs/
 *.log
 .DS_Store
+*.mov
+*.mp4
+*.m4v
+*.wav
