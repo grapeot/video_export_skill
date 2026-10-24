@@ -1,45 +1,47 @@
 # video_export_skill
 
-An agent skill suite (`skills/video-export/SKILL.md`) and planned Python command-line tool (`video-export`) for macOS video export and transcoding workflows. It provides two independently usable capabilities—exporting timelines from **DaVinci Resolve Studio** and transcoding media with **Apple Compressor**—plus an optional gated pipeline that connects them.
-
-> **Project Status (2026-10-24): Scaffold Phase.** This repository currently defines the product requirements, technical architecture, CLI and configuration contracts, test strategy, and agent skill specifications. The runtime Python package (`src/video_export/`) and automated test suite (`tests/`) are planned for the implementation milestone and are not yet present in this checkout.
+An agent skill suite (`skills/video-export/SKILL.md`) and Python command-line tool (`video-export`) for macOS video export and transcoding workflows. It provides two independently usable capabilities—rendering timelines from **DaVinci Resolve Studio** and transcoding media with **Apple Compressor**—plus an optional gated pipeline that connects them.
 
 ## Who it is for
 
-Video creators, educators, and developers on macOS who edit in DaVinci Resolve Studio, transcode delivery variants in Apple Compressor, or use either tool standalone with the help of a coding agent (Codex, Claude Code, Cursor, OpenCode, and similar).
+Video creators, educators, and developers on macOS who edit in DaVinci Resolve Studio, transcode delivery variants in Apple Compressor, or use either application standalone with a coding agent (Codex, Claude Code, Cursor, OpenCode, and similar).
 
-Driving Resolve and Compressor through ad-hoc shell commands is fragile: Resolve's external scripting API lacks readback methods for active render settings and unsaved project state, while Compressor's command-line interface requires strict flag ordering, returns a batch identifier as soon as a job is queued rather than finished, and can produce truncated outputs if handed a source file that is still being written. `video-export` wraps both tools behind a conservative, dry-run-first contract with machine-readable JSON output and media verification gates.
+Driving Resolve and Compressor through ad-hoc shell commands is fragile: Resolve's external scripting API mutates active render settings in memory without full readback methods, while Compressor's command-line interface requires strict flag ordering, returns a batch identifier as soon as a job is queued rather than finished, and can produce truncated outputs if handed a source file that is still being written. `video-export` wraps both tools behind a dry-run-first contract with machine-readable JSON output and media verification gates.
 
 ## Capabilities and boundaries
 
 - **Two standalone backends, one optional pipeline:**
-  - `video-export resolve ...` inspects projects, timelines, and render presets, and renders master outputs through DaVinci Resolve Studio's official Python scripting API.
-  - `video-export compressor ...` inspects `.compressorsetting` XML presets, submits single- or multi-target transcode batches through the Apple Compressor CLI executable, and monitors batch completion.
-  - `video-export pipeline run ...` renders a master file in Resolve, verifies that the file is completely written and valid via `ffprobe`, and only then submits it to Compressor for one or more delivery targets.
-- **Dry-run by default:** `resolve render`, `compressor transcode`, and `pipeline run` print a structured execution plan and touch nothing unless `--execute` is passed explicitly.
-- **One JSON object per command:** Every subcommand prints a single machine-readable JSON object to stdout (`--help` excepted) and records run state, job/batch identifiers, output paths, and verification results in a private per-run manifest.
+  - `video-export resolve ...` checks scripting availability, lists current-folder projects, inspects timelines and Deliver presets, and renders master outputs through DaVinci Resolve Studio's official Python scripting API.
+  - `video-export compressor ...` checks tool availability, parses `.compressorsetting` XML presets, submits single- or multi-target transcode batches through the Apple Compressor CLI executable, and queries batch status.
+  - `video-export pipeline run ...` renders a master file in Resolve (or reuses a manifest-verified master), checks writer closure and stream metadata via `lsof` and `ffprobe`, and submits the verified master to Compressor for one or more delivery targets.
+- **Dry-run by default:** `resolve render`, `compressor transcode`, and `pipeline run` validate configuration, Compressor preset XML, and output path collisions without connecting to Resolve, queueing jobs, or writing run manifests unless `--execute` is passed.
+- **One JSON object per command:** Every subcommand prints a single JSON object to stdout (`--help` excepted). Every `--execute` run records its resolved plan, backend job/batch IDs, media metadata, and status in a private per-run manifest (`~/.local/state/video-export/<run-id>/manifest.json` or `--state-dir`).
 - **Conservative toward running applications and files:**
-  - Refuses output path collisions; never overwrites existing files silently.
-  - Never deletes source clips or rendered master files automatically.
-  - Attaches to an already running Resolve instance by default (headless `-nogui` launch is explicit opt-in), refuses to switch away from a different open non-`Untitled` project in the GUI, never calls `SaveProject()`, starts only the render job ID it created, and never deletes other render queue jobs.
-  - Never submits a still-writing file to Compressor, and never resets Compressor background services or cancels pre-existing jobs.
-  - Never uploads or publishes media anywhere.
+  - Refuses output path collisions and never overwrites or auto-deletes source clips or rendered masters.
+  - Attaches to a running Resolve instance by default (`--headless` launch via `-nogui` is opt-in), never switches away from a different open named project in GUI mode, starts only the render job ID it created, and never deletes other render queue jobs.
+  - Never calls `SaveProject()`, though users should note that Resolve changes active render settings in memory and Resolve's own Live Save (if enabled) can persist those changes.
+  - Never submits a file with an open writer to Compressor, and never resets Compressor services or cancels existing jobs on timeout.
 
-Full architecture and empirical tool constraints are documented in [`docs/rfc.md`](docs/rfc.md).
+Full architecture and backend contracts are documented in [`docs/rfc.md`](docs/rfc.md).
 
-## Planned installation
+## Installation
 
-Requires macOS, Python 3.11 or newer, and [uv](https://github.com/astral-sh/uv). Runtime code uses only the Python standard library. `ffprobe` (and optionally `ffmpeg` for full-decode verification) is required when executing renders or transcodes. DaVinci Resolve Studio is required for `resolve` commands; Apple Compressor is required for `compressor` commands.
+Requires macOS, Python 3.11 or newer, and [uv](https://github.com/astral-sh/uv). Runtime code uses only the Python standard library. Executing renders or transcodes requires `ffprobe` and `lsof` on `PATH` (plus `ffmpeg` when `--verify-decode` is used), DaVinci Resolve Studio for `resolve` commands, and Apple Compressor for `compressor` commands.
 
-Once the runtime package is implemented:
+Install as a standalone CLI tool with `uv`:
+
+```bash
+uv tool install git+https://github.com/grapeot/video_export_skill
+```
+
+Or install from a local clone inside a virtual environment:
 
 ```bash
 git clone https://github.com/grapeot/video_export_skill
 cd video_export_skill
 uv venv
 source .venv/bin/activate
-uv pip install -e '.[dev]'
-python -m pytest -q
+uv pip install -e .
 ```
 
 ### Installing the skill into your coding agent
@@ -53,15 +55,17 @@ The agent should:
 
 ## Configuration: TOML profile and local overlay
 
-Public code and skill files contain no personal defaults or machine-specific paths. Configuration is separated into two local layers outside this repository:
-
-1. **Local private Markdown overlay (optional):** In your own workspace skill directory, you can keep a short private overlay note describing your personal workflow intent (for example, which profile file to use for different shows or export routines) and pointing to `skills/video-export/SKILL.md`.
-2. **External TOML profile:** Store concrete directory paths, Resolve preset names, and Compressor target `.compressorsetting` paths in an external TOML file passed via `--profile /path/to/profile.toml`:
+Store directory paths, Resolve defaults, and Compressor targets in an external TOML file passed via `--profile /path/to/profile.toml` (use absolute paths, as relative paths resolve against the current working directory):
 
 ```toml
 [resolve]
+project = "Demo Project"
+timeline = "Main Edit"
 preset = "ProRes_Master"
 output = "/path/to/exports/episode_master.mov"
+# Optional explicit format/codec override (must be supplied together):
+# format = "mov"
+# codec = "ProRes422HQ"
 
 [outputs]
 directory = "/path/to/exports"
@@ -73,12 +77,12 @@ suffix = "-1080p"
 
 [[compressor.targets]]
 setting = "/path/to/presets/archive_hevc.compressorsetting"
-suffix = "-hevc"
+output = "/path/to/exports/custom_archive.mov"
 ```
 
-Explicit CLI arguments always override values from the TOML profile.
+Explicit CLI flags override values from the TOML profile. In your own workspace, you can also keep an optional private Markdown overlay noting which TOML profile applies to each project.
 
-## Planned CLI quick start
+## CLI quick start
 
 ```bash
 # 1. Standalone DaVinci Resolve Studio workflow
@@ -113,13 +117,15 @@ video-export compressor status --batch-id "BATCH_ID"
 
 # 3. Connected Resolve -> Compressor pipeline
 video-export pipeline run \
-  --profile /path/to/profile.toml \
-  --project "Demo Project" \
-  --timeline "Main Edit"
+  --profile /path/to/profile.toml
 video-export pipeline run \
   --profile /path/to/profile.toml \
-  --project "Demo Project" \
-  --timeline "Main Edit" \
+  --execute
+
+# Reuse a previously rendered master via its explicit manifest path
+video-export pipeline run \
+  --profile /path/to/profile.toml \
+  --reuse-master /path/to/state/video-export/RUN_ID/manifest.json \
   --execute
 ```
 
@@ -127,8 +133,8 @@ video-export pipeline run \
 
 - [`AGENTS.md`](AGENTS.md) — Contributor and coding-agent invariants, environment setup, and safety rules.
 - [`docs/prd.md`](docs/prd.md) — Product requirements, user needs, command scope, and milestones.
-- [`docs/rfc.md`](docs/rfc.md) — Technical architecture, TOML schema, verified Resolve/Compressor behavior, and verification gates.
-- [`docs/test.md`](docs/test.md) — Offline unit/integration test plan, CI matrix, and opt-in macOS live test rules.
+- [`docs/rfc.md`](docs/rfc.md) — Technical architecture, TOML schema, Resolve/Compressor contracts, and verification gates.
+- [`docs/test.md`](docs/test.md) — Offline unit/integration test suite, CI matrix, and macOS live smoke verification.
 - [`docs/working.md`](docs/working.md) — Dated changelog and empirical lessons learned.
 - [`skills/video-export/SKILL.md`](skills/video-export/SKILL.md) — Root router skill for coding agents.
 

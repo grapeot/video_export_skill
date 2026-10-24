@@ -22,5 +22,8 @@ packages = ["src/video_export"]
 target-version = "py311"
 line-length = 100
 
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "UP"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

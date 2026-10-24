@@ -1,11 +1,9 @@
 ---
 name: video-export
-description: Export timelines from DaVinci Resolve Studio, transcode media with Apple Compressor, or run a verified Resolve-to-Compressor pipeline on macOS using the planned video-export CLI.
+description: Export timelines from DaVinci Resolve Studio, transcode media with Apple Compressor, or run a verified Resolve-to-Compressor pipeline on macOS using the video-export CLI.
 ---
 
 # Video Export (`video-export`)
-
-> **Scaffold Status (2026-10-24):** This repository is currently in the scaffold phase. The CLI contract (`video-export`), TOML profile schema, and backend safety rules below specify the planned runtime implementation. Before invoking `video-export`, check whether the package is installed in `.venv`; if the repository is still at the scaffold commit, treat these files as the authoritative design specification.
 
 Use this root skill whenever a task involves exporting timelines from **DaVinci Resolve Studio**, inspecting or running **Apple Compressor** `.compressorsetting` transcodes, or running a connected **Resolve -> verification -> Compressor** delivery pipeline on macOS.
 
@@ -16,33 +14,32 @@ This file is the **single root router skill** exposed to your workspace skill in
 | Task / Workflow | Focused Skill to Read | CLI Subcommands |
 |---|---|---|
 | Inspecting Resolve projects/timelines/presets or rendering a master export from DaVinci Resolve Studio | [`./resolve.md`](resolve.md) | `video-export resolve doctor \| projects \| inspect \| render` |
-| Inspecting `.compressorsetting` XML presets, submitting transcode batches, or monitoring batch status in Apple Compressor | [`./compressor.md`](compressor.md) | `video-export compressor doctor \| presets \| transcode \| status` |
-| Rendering a master in Resolve, verifying completion with `lsof` + `ffprobe`, and transcoding one or more targets in Compressor | [`./pipeline.md`](pipeline.md) | `video-export pipeline run` |
+| Inspecting `.compressorsetting` XML presets, submitting transcode batches, or querying batch status in Apple Compressor | [`./compressor.md`](compressor.md) | `video-export compressor doctor \| presets \| transcode \| status` |
+| Rendering a master in Resolve (or reusing a manifest-verified master), verifying completion with `lsof` + `ffprobe`, and transcoding targets in Compressor | [`./pipeline.md`](pipeline.md) | `video-export pipeline run` |
 
 ## Done Means (Acceptance Criteria)
 
 A `video-export` task is complete only when all applicable criteria below are met:
 
-1. **Dry-run plan reviewed first:** For `resolve render`, `compressor transcode`, or `pipeline run`, a dry-run invocation (without `--execute`) was run first and returned `ok: true` with no output path collisions and the expected resolved parameters.
-2. **Explicit execution and positive backend status:** When run with `--execute`, Resolve reported positive completion for the run's own `job_id` (when Resolve was used) and/or Compressor `-monitor` reached terminal status `Successful` (not merely queued with a `batchID` or still in `Waiting`/`Processing`).
-3. **Media verification passed:** Every produced master and target output file has no open writer (`lsof`), stable non-zero byte size across a bounded stability window, and valid `ffprobe` stream metadata matching expected duration, codec, resolution, and color tags when specified (plus clean `ffmpeg -v error -i ... -f null -` exit if `--verify-decode` was requested).
-4. **Manifest recorded:** The private per-run `manifest.json` path returned in the stdout JSON envelope records all resolved settings, job/batch IDs, output paths, and verification results.
+1. **Dry-run plan reviewed first:** For `resolve render`, `compressor transcode`, or `pipeline run`, a dry-run invocation (without `--execute`) returned `ok: true` with `dry_run: true`, valid configuration/preset XML, and no output path collisions. Note that dry-run does not connect to Resolve or verify that the Resolve project/timeline/preset exists; run `resolve inspect` first if Resolve names are uncertain.
+2. **Explicit execution and positive backend status:** Under `--execute`, Resolve reported `Complete` for the run's own `job_id` (and confirmed the actual queue `OutputFilename`) and/or Compressor `-monitor` reached terminal status `Successful` for the run's `batch_id`.
+3. **Media verification passed:** Every produced master and target output file passed `lsof` open-writer checks, constant non-zero size/mtime across `--stability-window`, and `ffprobe` validation (positive duration matching the timeline/source within `0.1`s, plus any `--expect-*` stream checks and optional `--verify-decode`).
+4. **Manifest recorded:** The `--execute` response returned the private per-run `manifest.json` path (`~/.local/state/video-export/<run-id>/manifest.json` or `--state-dir`) recording the plan, job/batch IDs, media metadata, and completion status.
 
-## Configuration Model: Public Skill vs Local Intent & TOML Profile
+## Configuration Model: Local Overlay & External TOML Profile
 
-- **No private defaults in public files:** Never hardcode personal directory paths, project names, or preset paths into this repository.
-- **Local private overlay (optional):** If the user's workspace maintains a private skill overlay (for example in `rules/skills/`), read it first to learn which external TOML profile or naming convention applies to the user's current project.
-- **External TOML profile (`--profile /path/to/profile.toml`):** Holds concrete paths and presets:
-  - `[resolve]`: `preset`, `output`
-  - `[outputs]`: `directory`, `keep_master`
-  - `[[compressor.targets]]`: `setting`, `suffix`
-- **CLI precedence:** Explicit CLI flags (`--project`, `--timeline`, `--preset`, `--output`, `--setting`, `--directory`) always override values from `--profile`. Unknown keys in TOML are rejected.
+- **Local private overlay (optional):** If the user's workspace maintains a private skill overlay (for example in `rules/skills/`), read it first to learn which external TOML profile or naming convention applies to the current task.
+- **External TOML profile (`--profile /path/to/profile.toml`):** Store paths and presets outside this repository (use absolute paths, as relative paths resolve against the invocation working directory):
+  - `[resolve]`: `project`, `timeline`, `preset`, `output`, `format`, `codec` (`format` and `codec` are optional explicit overrides and must be supplied together)
+  - `[outputs]`: `directory`, `keep_master` (`keep_master` must be `true`)
+  - `[[compressor.targets]]`: `setting`, `suffix`, `output` (each target requires `setting` and at least `suffix` or `output`)
+- **CLI precedence:** Explicit CLI flags (`--project`, `--timeline`, `--preset`, `--output`, `--format`, `--codec`, `--setting`, `--directory`) override values from `--profile`. In `pipeline run`, `--output` sets the master output path; in single-target `compressor transcode`, `--output` sets the target output path. Repeating `--setting` on the CLI overrides `[[compressor.targets]]` with suffixes `-1`, `-2`, etc.
 
 ## Hard Safety Boundaries
 
 - **Dry-run default:** Never pass `--execute` before running and inspecting the dry-run plan.
-- **One JSON object on stdout:** Parse the single JSON object printed to stdout by each `video-export` subcommand. Never auto-publish local stdout metadata or private log paths externally.
-- **No collisions or deletions:** Refuse any run where an output file already exists. Never overwrite existing media files, and never automatically delete source clips or rendered master files (`keep_master` must remain `true`).
-- **Conservative Resolve handling:** Attach to a running Resolve instance by default (`--headless` is explicit opt-in). Never silently switch away from a different open non-`Untitled` project in GUI mode, never call `SaveProject()`, never claim to restore all prior render settings, never use `Quick Export`, start only the run's own `job_id`, and never delete other render queue jobs. Never `SIGTERM` a GUI Resolve on timeout; quit an owned headless Resolve via the scripting API (`Quit()`).
-- **Conservative Compressor handling:** Never submit a source file that is still being written. Never call `Compressor -resetBackgroundProcessing` or cancel existing jobs without explicit user authorization.
-- **No uploading or publishing:** `video-export` only produces and verifies local media files.
+- **One JSON object on stdout:** Parse the single JSON object printed to stdout (`--help` excepted). Never auto-publish local stdout metadata, media files, or private manifests/logs.
+- **No collisions or deletions:** Refuse any run where an output file already exists (`output_collision`). Never overwrite existing files, and never delete source clips or rendered masters.
+- **Conservative Resolve handling:** Attach to a running Resolve instance by default (`--headless` is opt-in). Never silently switch away from another open named project in GUI mode (`foreign_project_loaded`). Never call `SaveProject()`, though loading presets/settings mutates active Deliver settings in memory and Resolve Live Save may persist them. Start only the run's own `job_id`. On timeout, leave active renders running and use the saved checkpoint/manifest for recovery; quit an owned `--headless` Resolve via `resolve.Quit()` only when no render is in progress.
+- **Conservative Compressor handling:** Never submit a file with an open writer. Never call `Compressor -resetBackgroundProcessing` or cancel existing batches automatically.
+- **Measured tags vs visual grading:** `--expect-color-*` checks `ffprobe` stream tags only and does not prove subjective HDR or Dolby Vision appearance.

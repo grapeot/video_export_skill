@@ -3,92 +3,75 @@
 - **Repository:** `https://github.com/grapeot/video_export_skill`
 - **License:** MIT (Copyright `grapeot`)
 - **Date:** 2026-10-24
-- **Status:** Scaffold Phase (Specification Complete; Runtime Implementation Planned)
+- **Status:** Implemented and Smoke-Verified on macOS
 
 ## 1. Problem Statement
 
-Creators and engineering teams on macOS frequently rely on **DaVinci Resolve Studio** to edit and render master timelines and **Apple Compressor** to transcode those masters into one or more delivery formats (or use either application independently). When users delegate these workflows to AI coding agents (such as Codex, Claude Code, Cursor, or OpenCode), ad-hoc scripting regularly hits failure modes in both applications:
+Creators and engineering teams on macOS rely on **DaVinci Resolve Studio** to edit and render master timelines and **Apple Compressor** to transcode those masters into delivery formats (or use either application independently). Delegating these workflows to coding agents through ad-hoc shell scripts hits failure modes in both applications:
 
 1. **DaVinci Resolve Studio state and IPC hazards:**
-   - Resolve's official Python scripting API exposes project, timeline, and render preset listing (`GetProjectManager`, `GetProjectListInCurrentFolder`, `LoadProject`, `GetTimelineCount`, `GetTimelineByIndex`, `GetCurrentRenderFormatAndCodec`, `GetRenderPresetList`), as well as render queue control (`AddRenderJob`, `StartRendering`, `GetRenderJobStatus`), but provides **no** `GetRenderSettings()` or `GetCurrentRenderPreset()` method and **no** proven query for unsaved ("dirty") project state.
-   - An agent that blindly calls `LoadProject()` against an active GUI session can silently switch away from the user's open project and risk unsaved edits.
-   - An agent that mutates render settings cannot restore all prior settings afterward.
-   - Sending `SIGTERM` to a headless `Resolve -nogui` process triggers the macOS Crash Reporter dialog unless quit cleanly through the scripting API.
+   - Resolve's Python scripting API exposes current-folder project listing, timeline inspection, and Deliver queue control (`AddRenderJob`, `StartRendering`, `GetRenderJobStatus`), but provides **no** `GetRenderSettings()` or `GetCurrentRenderPreset()` method and **no** reliable query for unsaved ("dirty") project state.
+   - Calling `LoadProject()` against an active GUI session can switch away from a user's open named project.
+   - Loading a preset or setting render target paths mutates active render settings in memory without a way to restore all prior settings, and Resolve's Live Save feature may persist those changes.
+   - Native scripting libraries (`fusionscript.so`) can emit non-JSON noise to stdout, and sending `SIGTERM` to a headless `Resolve -nogui` process triggers the macOS Crash Reporter dialog unless quit cleanly via `resolve.Quit()`.
 2. **Apple Compressor CLI and queue hazards:**
-   - `/Applications/Compressor.app/Contents/MacOS/Compressor` requires exact parameter shapes (`-locationpath` must be a full output file path, not a directory; `-monitor -format json -batchid <ID> -once` fails if `-format json` is placed at the end).
-   - Submitting a batch returns a `batchID` as soon as the request is queued—not when encoding starts or succeeds—and multiple target outputs in a single batch can be merged under a single `jobID`.
-   - `Waiting` status indicates the batch is queued behind busy transcode services rather than failed, whereas diagnostic text on stdout/stderr (such as `fileURL is NOT a directory`) can appear even on successful submissions.
-   - `.compressorsetting` files are custom XML documents (not Apple plists), and preset filenames do not guarantee output dimensions (`bounds` set to `-100` means follow source dimensions).
+   - `/Applications/Compressor.app/Contents/MacOS/Compressor` requires exact parameter shapes (`-locationpath` must be a full output file path; `-monitor -format json -batchid <ID> -once` fails if `-format json` is placed after `-once`).
+   - Submitting a batch returns a `batchID` as soon as the request is queued, and multiple target outputs in a single batch can share a single `jobID`.
+   - `Waiting` status indicates the batch is queued rather than failed, and diagnostic text on stdout/stderr can appear around valid JSON payloads.
+   - `.compressorsetting` files are custom XML documents (`<setting>`), where `bounds` width/height set to `-100` means follow source dimensions rather than fixed dimensions.
 3. **Premature hand-off between Resolve and Compressor:**
-   - While Resolve is rendering, the destination `.mov` file already exists on disk and grows over time. Submitting that file to Compressor before Resolve finishes writing and closes the file produces truncated or corrupt transcodes.
+   - While Resolve is rendering, the destination file already exists on disk and grows over time. Submitting that file to Compressor before Resolve closes it produces truncated or corrupt transcodes.
 
 ## 2. Product Overview
 
-`video_export_skill` provides a single Python CLI (`video-export`) and a modular agent skill suite (`skills/video-export/`) with two standalone capabilities and one optional connected pipeline:
+`video_export_skill` provides a stdlib-only Python CLI (`video-export`) and a modular agent skill suite (`skills/video-export/`) with two standalone capabilities and one optional connected pipeline:
 
-1. **DaVinci Resolve Studio Export (`video-export resolve`):** Environment diagnostics, project and timeline inspection, and conservative timeline rendering.
-2. **Apple Compressor Transcode (`video-export compressor`):** Environment diagnostics, `.compressorsetting` XML inspection, single- or multi-target batch submission, and batch status monitoring.
-3. **Connected Pipeline (`video-export pipeline run`):** End-to-end orchestration that renders a master in Resolve (or reuses a provenance-verified master), verifies file completion and stream integrity via `ffprobe`, and runs one or more Compressor target transcodes with post-transcode verification.
+1. **DaVinci Resolve Studio Export (`video-export resolve`):** Scripting diagnostics (`doctor`), current-folder project listing (`projects`), timeline and preset inspection (`inspect`), and Deliver queue timeline rendering (`render`).
+2. **Apple Compressor Transcode (`video-export compressor`):** Binary and helper diagnostics (`doctor`), `.compressorsetting` XML inspection (`presets`), verified single- or multi-target batch submission (`transcode`), and batch status querying (`status`).
+3. **Connected Pipeline (`video-export pipeline run`):** Sequential workflow that renders a master in Resolve (or reuses a manifest-verified master), checks writer closure and media metadata via `lsof` and `ffprobe`, and runs one or more Compressor target transcodes with post-transcode verification.
 
 ## 3. Target Users and Configuration Model
 
 ### Target users
-- Individual creators, technical instructors, and media engineers on macOS who use coding agents to inspect timelines, render master exports, or generate delivery transcodes without manually clicking through GUI dialogs on every run.
+- Creators, technical instructors, and media engineers on macOS who use coding agents to inspect timelines, render master exports, or generate delivery transcodes with predictable dry-run and verification gates.
 
 ### Public/private separation
-- **Public repository (`grapeot/video_export_skill`):** Contains only generic, reusable CLI code, offline tests, documentation, and agent skills. It includes no hardcoded personal paths, project names, or preset defaults.
-- **External TOML profile (`/path/to/profile.toml`):** Holds a user's preferred Resolve preset name, master output location, output directory, and Compressor target list (`setting` path + filename `suffix`).
-- **Local private Markdown overlay (optional):** Lives in the user's private workspace skill directory to capture personal workflow intent (such as which TOML profile applies to which series) while routing technical execution to `skills/video-export/SKILL.md`.
-- **Single root skill discovery:** Coding agents index only `skills/video-export/SKILL.md`, which routes on demand to `resolve.md`, `compressor.md`, or `pipeline.md`.
+- **Public repository (`grapeot/video_export_skill`):** Contains generic, reusable CLI code, offline tests, documentation, and agent skills with no personal paths or preset defaults.
+- **External TOML profile (`--profile /path/to/profile.toml`):** Holds `[resolve]` (`project`, `timeline`, `preset`, `output`, optional `format`/`codec`), `[outputs]` (`directory`, `keep_master`), and `[[compressor.targets]]` (`setting`, `suffix`, `output`).
+- **Local private Markdown overlay (optional):** Lives in the user's workspace skill directory to map personal projects to external TOML profiles while routing technical execution to `skills/video-export/SKILL.md`.
+- **Single root skill discovery:** Coding agents index only `skills/video-export/SKILL.md`, loading `resolve.md`, `compressor.md`, or `pipeline.md` on demand.
 
-## 4. Functional Requirements
+## 4. Implemented Functional Scope
 
-### 4.1 Planned CLI command surface
-- `video-export resolve doctor` — Check Resolve installation, scripting API/library paths, and whether a running Resolve instance is reachable.
-- `video-export resolve projects` — List projects in the current Resolve folder alongside the currently open project name.
-- `video-export resolve inspect [--project NAME]` — List timelines, frame rates/resolutions where available, current render format/codec, and render preset list without switching away from a different open non-`Untitled` GUI project.
-- `video-export resolve render ... [--execute]` — Plan or execute a timeline render using a named Resolve preset and explicit output path.
-- `video-export compressor doctor` — Check `/Applications/Compressor.app/Contents/MacOS/Compressor` and `ffprobe`/`ffmpeg` availability.
-- `video-export compressor presets --setting /path/to/preset.compressorsetting` — Parse `.compressorsetting` XML and report codec, container, frame rate, and whether dimensions are fixed or source-following (`-100`).
-- `video-export compressor transcode ... [--execute]` — Plan or execute a single- or multi-target Compressor transcode batch after validating source stability and `ffprobe` metadata.
-- `video-export compressor status --batch-id ID` — Query `-monitor -format json -batchid ID -once`, parse status tolerantly, and distinguish queued (`Waiting`/`Processing`) from terminal (`Successful` vs `Failed`/`Cancelled`) states.
-- `video-export pipeline run ... [--execute]` — Plan or execute the connected Resolve render -> verification -> Compressor transcode workflow.
+### 4.1 CLI command surface
+- `video-export resolve doctor [--timeout SEC] [--headless]` — Connect to Resolve (or launch `-nogui` when `--headless` is set) and report product name, version, and current database.
+- `video-export resolve projects [--timeout SEC] [--headless]` — List projects and folders in the current Resolve database folder (`GetProjectListInCurrentFolder`, `GetFolderListInCurrentFolder`, `GetCurrentFolder`, `GetCurrentDatabase`).
+- `video-export resolve inspect [--project NAME] [--timeout SEC] [--headless]` — Inspect active or requested project timelines (name, fps, frame count, duration, width, height), Deliver render presets, current render format/codec, and render queue jobs. May load `--project NAME` only when no project or `"Untitled Project"` is open (or in an owned `--headless` session); never switches away from another named project.
+- `video-export resolve render ... [--execute]` — Validate configuration and output path collisions in dry-run mode, or render a full timeline in single-clip Deliver mode and verify the output file under `--execute`.
+- `video-export compressor doctor [--timeout SEC]` — Report Compressor binary path/existence and `ffprobe`, `ffmpeg`, and `lsof` locations.
+- `video-export compressor presets [--setting PATH ...] [--timeout SEC]` — Parse explicit or auto-discovered `.compressorsetting` XML files and report name, extension, codec, frame rate, bounds, `resolution_mode` (`follow_source` vs `explicit_or_other`), and whether video encoding is enabled.
+- `video-export compressor transcode --input PATH ... [--execute]` — Validate preset XML and target output collisions in dry-run mode, or verify source stability/metadata, submit a Compressor batch, poll until `Successful`, and verify all target outputs under `--execute`.
+- `video-export compressor status --batch-id ID [--timeout SEC]` — Query `Compressor -monitor -format json -batchid ID -once` and extract the scoped batch status.
+- `video-export pipeline run ... [--execute]` — Plan or execute the Resolve master render (or `--reuse-master MANIFEST` provenance check) followed by Compressor transcoding and target verification.
 
-### 4.2 Configuration and precedence
-- Support an external TOML profile with sections:
-  - `[resolve]`: `preset`, `output`
-  - `[outputs]`: `directory`, `keep_master`
-  - `[[compressor.targets]]`: `setting`, `suffix`
-- Explicit CLI arguments always override TOML profile values.
-- Reject unknown TOML keys with a structured validation error so typos in profile files never fail silently.
+### 4.2 Dry-run vs execute and per-run manifests
+- Dry-runs (`render`, `transcode`, `pipeline run` without `--execute`) perform local configuration validation, Compressor XML parsing, and output collision checks only. They do not connect to Resolve, do not verify whether a Resolve preset exists in the project, do not queue jobs, and do not write state manifests.
+- Passing `--execute` creates a private run directory (`~/.local/state/video-export/<run-id>/manifest.json` or `--state-dir`, permissions `0o700`/`0o600`) and records the plan, checkpoints, job/batch IDs, media properties, and terminal status.
 
-### 4.3 Dry-run planning, execution gate, and per-run manifest
-- Every `render`, `transcode`, and `pipeline run` invocation defaults to dry-run mode: it validates arguments, checks for output path collisions, and prints the resolved plan as JSON without modifying projects, queueing jobs, or writing media files.
-- Passing `--execute` is required to queue a Resolve render or Compressor batch.
-- Every run writes a private local manifest (`manifest.json`) recording the resolved configuration, Resolve `job_id`, Compressor `batchID` and `jobID`s, output file paths, hashes/sizes, and verification status.
+### 4.3 Verification and master reuse provenance
+- Execution requires `lsof` (no open writer descriptors `aw`/`au`), constant non-zero file size and `mtime_ns` across `--stability-window` seconds, and `ffprobe` validation (positive finite duration, video stream presence, duration matching timeline or source within `0.1`s, plus optional `--expect-*` checks and `--verify-decode`).
+- `--reuse-master MANIFEST` requires an explicit path to a prior `manifest.json` and verifies that the Resolve configuration identity (`project`, `timeline`, `preset`, `output`, `format`, `codec`) and on-disk file metadata (`path`, `size`, `mtime_ns`) match the verified master record. This metadata check avoids hashing multi-gigabyte files on retry; it does not detect unsaved/saved edits inside the Resolve project, so users must render a fresh master after editing a timeline.
 
-### 4.4 Verification and provenance gating
-- Before submitting any file to Compressor under `--execute`, verify that no process holds the source file open for writing (`lsof`), that byte size remains constant across a bounded stability window, and that `ffprobe` confirms valid media streams and expected duration/codec/resolution/color tags when specified.
-- In `pipeline run --execute`, Compressor submission proceeds **only** if Resolve reports positive job completion **and** the master file passes the stability and `ffprobe` checks.
-- Reusing an existing master file in `pipeline run` (`--reuse-master`) is permitted **only** when a prior per-run `manifest.json` proves the file's provenance and its on-disk size/hash match the manifest.
-- Support optional full stream decoding (`--verify-decode` via `ffmpeg -v error -i /path/to/file.mov -f null -`) when explicitly requested by the user or agent.
+## 5. Non-Goals and Known Limitations
 
-## 5. Non-Goals and Safety Boundaries
+- **No render settings restoration or dirty-state detection in Resolve:** Active Deliver settings are mutated in memory during `render`, and Resolve's Live Save may persist them.
+- **No recursive Resolve folder traversal:** `resolve projects` inspects the current database folder only.
+- **No Quick Export:** Only standard Deliver queue presets are used.
+- **No automatic HDR/Dolby Vision semantic grading check:** `--expect-color-*` checks container/stream tags reported by `ffprobe`, which do not prove subjective display appearance. Large exports, HDR/Dolby Vision workflows, and 8K timelines have not been live-validated.
+- **No job cancellation on timeout and no background daemon:** Timeouts leave active Resolve renders or Compressor batches running and retain checkpoint/manifest identifiers for manual inspection.
 
-- **No silent project switching or saving in Resolve:** Never switch away from a different loaded non-`Untitled` project in an attached GUI session, and never call `SaveProject()`.
-- **No unverified Resolve claims:** Do not claim to snapshot and restore all Resolve render settings, and do not automate or claim safety for Resolve `Quick Export`.
-- **No destructive file operations:** Refuse all output path collisions; never overwrite existing files and never automatically delete source clips or master exports.
-- **No disruptive queue/service actions:** Never delete other jobs in Resolve's render queue, never cancel existing Compressor batches automatically, and never invoke `Compressor -resetBackgroundProcessing`.
-- **No publishing or background daemons:** Never upload files to external platforms, and do not introduce a resident background daemon or plugin framework.
+## 6. Milestones
 
-## 6. Milestones and Success Criteria
-
-1. **Milestone 1 — Repository Scaffold (Current):**
-   - Author complete English documentation (`README.md`, `AGENTS.md`, `docs/prd.md`, `docs/rfc.md`, `docs/test.md`, `docs/working.md`) and agent skills (`skills/video-export/SKILL.md`, `resolve.md`, `compressor.md`, `pipeline.md`).
-   - Initialize and publish `master` with branch protection requiring pull requests, 0 approving reviews, and `enforce_admins=true`.
-2. **Milestone 2 — Runtime Implementation & Verification:**
-   - Implement `src/video_export/` (`cli`, `config`, `resolve`, `compressor`, `pipeline`, `verification`, `state`) and the offline `pytest` suite on a feature branch.
-   - Pass GitHub Actions CI on Ubuntu across Python 3.11, 3.12, and 3.13 (`uv venv` + `uv pip install -e '.[dev]'`, `ruff`, `pytest`).
-   - Execute opt-in macOS live verification against generated scratch media and a disposable scratch Resolve project; record sanitized results in `docs/working.md` and merge via pull request.
-3. **Milestone 3 — Skill Ecosystem Registration:**
-   - Register `grapeot/video_export_skill` in public agent skill ecosystems and registries so coding agents can install the unified skill directly from GitHub.
+1. **Milestone 1 — Repository Scaffold (Completed 2026-10-24):** Defined requirements, architecture, CLI/TOML specifications, and skill routing.
+2. **Milestone 2 — Runtime Implementation & Verification (Completed 2026-10-24):** Implemented `src/video_export/` and offline `pytest` suite (52 tests passing), and verified live macOS smoke execution across headless Resolve Studio (`ProRes 422 HQ` master + clean `Quit()`) and Apple Compressor (`HEVC .mov` delivery + full `ffmpeg` decode).
+3. **Milestone 3 — Skill Ecosystem Registration:** Register `grapeot/video_export_skill` in public agent skill indices and registries.
