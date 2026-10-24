@@ -1,0 +1,11 @@
+[resolve]
+preset = "ProRes 422 HQ"
+output = "/path/to/exports/master.mov"
+
+[outputs]
+directory = "/path/to/exports"
+keep_master = true
+
+[[compressor.targets]]
+setting = "/path/to/presets/delivery.compressorsetting"
+suffix = "-delivery"
