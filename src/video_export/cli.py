@@ -54,16 +54,20 @@ def build_parser():
             cmd.add_argument("--stability-window", type=positive, default=2)
             cmd.add_argument("--poll", type=positive, default=5)
             cmd.add_argument("--expect-duration", type=positive)
+            cmd.add_argument("--expect-frame-rate", type=positive)
             cmd.add_argument("--expect-codec")
             cmd.add_argument("--expect-resolution")
             for tag in ("color-primaries", "color-transfer", "color-space"):
                 cmd.add_argument("--expect-" + tag)
             if backend in ("resolve", "pipeline"):
-                for flag in ("project", "timeline", "preset", "format", "codec"):
+                for flag in ("project", "timeline", "preset", "format", "codec", "resolution",
+                             "frame-rate", "audio-codec", "audio-bit-depth", "audio-sample-rate"):
                     cmd.add_argument("--" + flag)
             if backend == "compressor":
                 cmd.add_argument("--input", required=True)
                 cmd.add_argument("--setting", action="append")
+            if backend in ("compressor", "pipeline"):
+                cmd.add_argument("--max-frame-rate", type=positive)
             if backend == "pipeline":
                 cmd.add_argument("--setting", action="append")
                 cmd.add_argument("--reuse-master", metavar="MANIFEST")
@@ -71,7 +75,8 @@ def build_parser():
 
 
 def expectations(args):
-    result = {"duration": args.expect_duration, "codec_name": args.expect_codec,
+    result = {"duration": args.expect_duration, "frame_rate": args.expect_frame_rate,
+              "codec_name": args.expect_codec,
               "color_primaries": args.expect_color_primaries,
               "color_transfer": args.expect_color_transfer, "color_space": args.expect_color_space}
     if args.expect_resolution:
@@ -114,8 +119,8 @@ def execute(args):
         if args.backend == "compressor" and not path(source).is_file():
             raise ExportError("source_invalid", "Input file does not exist")
         targets = compressor.plan_targets(source, profile, args.setting,
-                                           args.output if args.backend == "compressor" else None,
-                                           args.directory)
+                                            args.output if args.backend == "compressor" else None,
+                                            args.directory, args.max_frame_rate)
     plan = {"resolve": config, "targets": targets,
             "input": str(path(args.input)) if args.backend == "compressor" else None,
             "expected": checks,

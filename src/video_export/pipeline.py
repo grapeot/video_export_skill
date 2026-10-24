@@ -1,21 +1,35 @@
 """Composition of independent backends with a verified handoff."""
 
 from . import compressor, resolve
-from .common import outputs_available
+from .common import ExportError, outputs_available
 from .state import fingerprint, identity, reuse_master
 from .verification import verify
 
 
 def render_master(config, state, timeout=3600, headless=False, window=2, decode=False, expected=None):
+    checks = {}
+    if config.get("resolution"):
+        checks["width"], checks["height"] = map(int, config["resolution"].lower().split("x"))
+    if config.get("frame_rate"):
+        checks["frame_rate"] = config["frame_rate"]
+    for key, value in (expected or {}).items():
+        if key == "duration":
+            continue
+        if key in checks:
+            matches = (abs(checks[key] - value) < 0.01 if key == "frame_rate"
+                       else checks[key] == value)
+            if not matches:
+                raise ExportError("expectation_conflict", "Expected media conflicts with render override",
+                                  field=key, configured=checks[key], requested=value)
+        else:
+            checks[key] = value
     state.save(resolve_config=config)
     result = resolve.call("render", config, timeout=timeout, headless=headless,
                           checkpoint=state.folder / "resolve-job.json")
-    checks = {"duration": result["timeline"]["duration"]}
+    checks["duration"] = result["timeline"]["duration"]
     if expected and expected.get("duration") is not None:
         if abs(expected["duration"] - checks["duration"]) > 0.1:
-            from .common import ExportError
             raise ExportError("expectation_conflict", "Expected duration conflicts with timeline")
-    checks.update({k: v for k, v in (expected or {}).items() if k != "duration"})
     media = verify(config["output"], checks, decode=decode, window=window, timeout=timeout)
     master = {"identity": identity(config), "fingerprint": fingerprint(config["output"]),
               "verified": True, "media": media, "resolve": result}

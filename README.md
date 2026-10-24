@@ -11,10 +11,10 @@ Driving Resolve and Compressor through ad-hoc shell commands is fragile: Resolve
 ## Capabilities and boundaries
 
 - **Two standalone backends, one optional pipeline:**
-  - `video-export resolve ...` checks scripting availability, lists current-folder projects, inspects timelines and Deliver presets, and renders master outputs through DaVinci Resolve Studio's official Python scripting API.
-  - `video-export compressor ...` checks tool availability, parses `.compressorsetting` XML presets, submits single- or multi-target transcode batches through the Apple Compressor CLI executable, and queries batch status.
+  - `video-export resolve ...` checks scripting availability, lists current-folder projects, inspects timelines and Deliver presets, and renders master outputs through DaVinci Resolve Studio's official Python scripting API (with optional post-preset render overrides for resolution, frame rate, and audio codec/bit-depth/sample-rate).
+  - `video-export compressor ...` checks tool availability, parses `.compressorsetting` XML presets (including `R`-prefixed rational frame rates and `automatic_geometry` metadata), submits single- or multi-target transcode batches through the Apple Compressor CLI executable (with optional `--max-frame-rate` cap-preserving cadence derivation), and queries batch status.
   - `video-export pipeline run ...` renders a master file in Resolve (or reuses a manifest-verified master), checks writer closure and stream metadata via `lsof` and `ffprobe`, and submits the verified master to Compressor for one or more delivery targets.
-- **Dry-run by default:** `resolve render`, `compressor transcode`, and `pipeline run` validate configuration, Compressor preset XML, and output path collisions without connecting to Resolve, queueing jobs, or writing run manifests unless `--execute` is passed.
+- **Dry-run by default:** `resolve render`, `compressor transcode`, and `pipeline run` validate configuration, Compressor preset XML, and output path collisions without connecting to Resolve, probing media sources, creating derived presets, queueing jobs, or writing run manifests unless `--execute` is passed.
 - **One JSON object per command:** Every subcommand prints a single JSON object to stdout (`--help` excepted). Every `--execute` run records its resolved plan, backend job/batch IDs, media metadata, and status in a private per-run manifest (`~/.local/state/video-export/<run-id>/manifest.json` or `--state-dir`).
 - **Conservative toward running applications and files:**
   - Refuses output path collisions and never overwrites or auto-deletes source clips or rendered masters.
@@ -66,10 +66,20 @@ output = "/path/to/exports/episode_master.mov"
 # Optional explicit format/codec override (must be supplied together):
 # format = "mov"
 # codec = "ProRes422HQ"
+# Optional post-preset render setting overrides (profile values are strings):
+# resolution = "3840x2160"
+# frame_rate = "59.94"
+# audio_codec = "lpcm"
+# audio_bit_depth = "24"
+# audio_sample_rate = "48000"
 
 [outputs]
 directory = "/path/to/exports"
 keep_master = true
+
+[compressor]
+# Optional cap-preserving cadence ceiling (preserves <= cap, halves above cap):
+# max_frame_rate = 60
 
 [[compressor.targets]]
 setting = "/path/to/presets/web_1080p.compressorsetting"
