@@ -11,6 +11,7 @@ from .rates import delivery_rate, rate
 from .verification import verify
 
 DEFAULT_BINARY = "/Applications/Compressor.app/Contents/MacOS/Compressor"
+FOLLOW_SOURCE_RATES = ("0", "0.0", "R0/1", "-100", "-100.0")
 
 
 def binary():
@@ -38,7 +39,8 @@ def preset(filename):
     if any(value not in (None, "", "0", "-100") for value in automatic_geometry.values()):
         resolution_mode = "automatic_geometry"
     frame_rate = video.findtext("frame-rate") if video is not None else None
-    if frame_rate and frame_rate not in ("0", "R0/1", "-100"):
+    frame_rate = frame_rate.strip() if frame_rate is not None else None
+    if frame_rate and frame_rate not in FOLLOW_SOURCE_RATES:
         rate(frame_rate)
     return {"setting": str(file), "name": root.get("name"), "extension": extension,
             "codec": video.findtext("codec-type") if video is not None else None,
@@ -126,8 +128,8 @@ def preset_expectations(metadata, source_info):
             checks[key] = int(value)
         # Follow-source dimensions can include cropping or padding; do not infer
         # geometry from -100 alone. Explicit --expect-resolution remains available.
-    frame_rate = metadata.get("frame_rate")
-    if frame_rate and frame_rate not in ("0", "R0/1", "-100"):
+    frame_rate = (metadata.get("frame_rate") or "").strip()
+    if frame_rate and frame_rate not in FOLLOW_SOURCE_RATES:
         checks["frame_rate"] = float(rate(frame_rate))
     return checks
 
@@ -141,11 +143,22 @@ def delivery_targets(targets, source_info, state):
             source_rate = source_info["video"].get("avg_frame_rate")
             selected = delivery_rate(source_rate, target["max_frame_rate"])
             text = path(target["setting"]).read_bytes()
+            xml = ET.fromstring(text)
+            elements = xml.findall(".//video-encode/frame-rate")
+            if len(elements) != 1 or len(xml.findall(".//video-encode")) != 1:
+                raise ExportError("preset_invalid", "Delivery policy needs one video frame-rate element")
             replacement = f"R{selected.numerator}/{selected.denominator}".encode()
-            text, count = re.subn(rb"(<frame-rate>)[^<]*(</frame-rate>)",
-                                  lambda m: m[1] + replacement + m[2], text)
+            video = re.search(rb"<video-encode\b[^>]*>.*?</video-encode>", text, re.DOTALL)
+            if not video:
+                raise ExportError("preset_invalid", "Unsupported video-encode XML representation")
+            changed, count = re.subn(rb"(<frame-rate>)[^<]*(</frame-rate>)",
+                                     lambda m: m[1] + replacement + m[2], video[0])
             if count != 1:
                 raise ExportError("preset_invalid", "Delivery policy needs one frame-rate element")
+            text = text[:video.start()] + changed + text[video.end():]
+            parsed = ET.fromstring(text).findtext(".//video-encode/frame-rate")
+            if rate(parsed.strip() if parsed else None) != selected:
+                raise ExportError("preset_invalid", "Derived video frame rate does not match policy")
             derived = state.folder / f"delivery-{index + 1}.compressorsetting"
             with derived.open("xb") as stream:
                 stream.write(text)

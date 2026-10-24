@@ -177,11 +177,30 @@ def test_delivery_setting_changes_only_rate_and_never_original(setting, tmp_path
     assert state.data["prepared_targets"] == prepared
 
 
-def test_rounded_ntsc_expectation_matches_rational_preset(tmp_path, monkeypatch):
+@pytest.mark.parametrize("label,preset_rate", [(29.97, "R30000/1001"), (59.94, "59.94"),
+    (59.94, "R60000/1001"), (23.976, "R24000/1001"), (119.88, "R120000/1001")])
+def test_rounded_ntsc_expectation_matches_rational_preset(tmp_path, monkeypatch, label, preset_rate):
     monkeypatch.setattr(compressor, "verify", lambda *a, **k: {"duration": 2})
     monkeypatch.setattr(compressor, "run", lambda *a, **kw: '{"batch":{"batchID":"b"}}')
     monkeypatch.setattr(compressor, "status", lambda *a, **kw: {"batchid": "b", "status": "Successful"})
     targets = [{"output": str(tmp_path / "out.mov"), "setting": "/path/preset",
-                "preset": {"frame_rate": "R30000/1001"}}]
+                "preset": {"frame_rate": preset_rate}}]
     assert compressor.transcode(tmp_path / "source.mov", targets, RunState(tmp_path / "runs"),
-                                expected={"frame_rate": 29.97})["batch_id"] == "b"
+                                expected={"frame_rate": label})["batch_id"] == "b"
+
+
+@pytest.mark.parametrize("text", ["\n-100\n", " -100 ", "0.0", " R0/1 "])
+def test_follow_source_rate_whitespace(setting, text):
+    setting.write_text(setting.read_text().replace("<frame-rate>-100</frame-rate>",
+                                                  f"<frame-rate>{text}</frame-rate>"))
+    assert "frame_rate" not in compressor.preset_expectations(compressor.preset(setting), {})
+
+
+def test_delivery_policy_rejects_non_video_rate_without_submitting(setting, tmp_path):
+    setting.write_text(setting.read_text().replace("<frame-rate>-100</frame-rate>", "").replace(
+        "</setting>", "<frame-rate>60</frame-rate></setting>"))
+    targets = compressor.plan_targets(tmp_path / "source.mov", {}, [setting], max_frame_rate=60)
+    state = RunState(tmp_path / "runs")
+    with pytest.raises(ExportError, match="video frame-rate"):
+        compressor.delivery_targets(targets, {"video": {"avg_frame_rate": "30000/1001"}}, state)
+    assert not list(state.folder.glob("*.compressorsetting"))

@@ -28,6 +28,29 @@ def test_master_verification_failure_blocks_compressor(tmp_path, monkeypatch):
         pipeline.execute({"output": str(tmp_path / "master.mov")}, [], RunState(tmp_path / "state"))
 
 
+@pytest.mark.parametrize("expected", [{"frame_rate": 30}, {"width": 1920}, {"height": 1080}])
+def test_render_expectation_cannot_replace_override(tmp_path, monkeypatch, expected):
+    monkeypatch.setattr(pipeline.resolve, "call", lambda *a, **kw: pytest.fail("render submitted"))
+    config = {"output": str(tmp_path / "master.mov"), "resolution": "7680x4320", "frame_rate": 24}
+    with pytest.raises(ExportError) as error:
+        pipeline.render_master(config, RunState(tmp_path / "state"), expected=expected)
+    assert error.value.code == "expectation_conflict"
+
+
+def test_master_must_match_configured_geometry_and_rate(tmp_path, monkeypatch):
+    file = tmp_path / "master.mov"
+    file.write_bytes(b"synthetic")
+    monkeypatch.setattr(pipeline.resolve, "call", lambda *a, **kw: {"timeline": {"duration": 2}})
+    monkeypatch.setattr(verification, "stable_file", lambda *a: None)
+    monkeypatch.setattr(verification, "inspect_media", lambda *a: {
+        "duration": 2, "video": {"width": 1280, "height": 720, "avg_frame_rate": "30/1"}})
+    monkeypatch.setattr(pipeline, "verify", verification.verify)
+    with pytest.raises(ExportError) as error:
+        pipeline.render_master({"output": str(file), "resolution": "7680x4320", "frame_rate": 24},
+                               RunState(tmp_path / "state"))
+    assert error.value.code == "media_mismatch"
+
+
 def test_reuse_requires_matching_file_and_configuration(tmp_path):
     file = tmp_path / "master.mov"
     file.write_bytes(b"synthetic")
